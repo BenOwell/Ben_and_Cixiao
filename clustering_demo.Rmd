@@ -1,0 +1,165 @@
+---
+title: "Clustering demo for Cixiao"
+author: "Ben"
+date: "2023-11-30"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Libraries
+
+```{r}
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 60), tidy = TRUE)
+library(tm)
+set.seed(1)
+```
+
+# Simulating data for testing methodology
+
+## Defining a dictionary
+
+With the code below I define a corpus just by taking a sentence from a recent BBC article.
+```{r}
+bbctext<-"In Moscow men holding reindeer antlers above their heads are dancing around a stage. It is a traditional marriage ceremony originating from the far north of Russia. Bride and groom, Ilona and Alexander, are sitting by a mock campfire and observing time-honoured rituals, like the ripping of cloth and a dance with animal furs."
+bbctext<-removePunctuation(bbctext)
+corpus<-unique(strsplit(bbctext,split=" ")[[1]])
+n_corpus<-length(corpus)
+```
+
+I now simulate some data for $N$ users and $M$ clusters/groups.
+```{r}
+N<-128
+M<-3
+simmed_data<-data.frame(usernames=1:N,cluster=sample.int(M,size=N,replace=T),forecast=NA,comment=NA)
+head(simmed_data)
+```
+
+I pretend that each forecaster produces a numerical estimate/forecast. These estimates are random variables whose expectation depends on the forecaster's cluster.
+```{r}
+forecast_means<-seq(-1,1,length=M)*2
+for(m in 1:M){
+ind<-which(simmed_data$cluster==m)
+simmed_data$forecast[ind]<-rnorm(length(ind),forecast_means[m],1)  
+}
+```
+
+I now simulate $M$ distributions over words from a Dirichlet distribution. I simulate a comment for each user using words drawn from the distribution for their cluster.
+```{r}
+text_probs<-matrix(rgamma(n_corpus*M,1,1),n_corpus,M)
+text_probs<-apply(text_probs,2,function(x){x/sum(x)})
+par(mfcol=c(3,1));for(m in 1:M){barplot(text_probs[,m],ylab="probability",xlab="word",main=paste("cluster  ",m),space=0);axis(1,at=1:n_corpus-.5,labels=corpus,las=2)}
+
+comment_length<-40
+for(i in 1:N){
+simmed_data$comment[i]<-paste(sample(corpus,size=comment_length,replace=T,prob=text_probs[ , simmed_data$cluster[i] ]),collapse=" ")
+}
+
+head(simmed_data)
+```
+
+# Recovering the cluster numbers
+
+I now make a copy of the simulated data but I remove the cluster numbers, which we will try to recover using the forecasts and the comments.
+```{r}
+simmed_data2<-simmed_data
+simmed_data2$cluster<-NA
+head(simmed_data2)
+```
+We will estimate the cluster numbers using a Gibbs sampler (please read up on this method if you do not remember what it involves). We initialize the algorithm by simulating cluster numbers for the forecasters
+```{r}
+simmed_data2$cluster<-sample.int(M,size=N,replace=T)
+```
+Then, conditioning on the simulated cluster numbers, we estimate the word distributions 
+```{r}
+alphamat<-matrix(1,n_corpus,M);rownames(alphamat)<-corpus;colnames(alphamat)<-paste("cluster ",1:M)
+for(m in 1:M){
+ind<-which(simmed_data2$cluster==m) 
+word_counts<-table(factor( strsplit(paste(simmed_data2$comment[ind],collapse=" "),split=" ")[[1]] ,levels=corpus))
+alphamat[,m]<-1+word_counts
+}
+head(alphamat)
+```
+The values in the alphamat matrix contain the alphas that parameterize the Dirichlet posterior for the word probabilities. We then sample from these posteriors and condition on these word probabilities
+```{r}
+estimated_text_probs<-matrix(NA,n_corpus,M)
+rownames(estimated_text_probs)<-corpus;colnames(estimated_text_probs)<-paste("cluster ",1:M)
+for(m in 1:M){
+p<-rgamma(n_corpus,alphamat[,m],1)
+estimated_text_probs[,m]<-p/sum(p)
+}
+head(estimated_text_probs)
+```
+We also compute posterior expectations for the forecasts for each cluster
+```{r}
+estimated_forecast_means<-rep(0,M)
+for(m in 1:M){
+ind<-which(simmed_data$cluster==m)
+estimated_forecast_means[m]<-rnorm( 1,mean=mean(simmed_data2$forecast[ind]),sd=1/(1+length(ind)) )
+}
+estimated_forecast_means
+```
+
+Now we condition on the word distributions and forecast distributions for each cluster and simulate the cluster memberships for each user. This is another Bayesian calculation in which we compute the posterior distribution for cluster memberships, which is proportional to the prior (which for the time being I assumed is uniform) multiplied by the likelihood (please also make sure you are comfortable with this. It is very important).
+```{r}
+cluster_log_probs<-matrix(NA,N,M)
+rownames(cluster_log_probs)<-paste("user ",1:N);colnames(cluster_log_probs)<-paste("cluster ",1:M)
+for(i in 1:N){
+word_count_i<-table(factor( strsplit(simmed_data2$comment[i],split=" ")[[1]] ,levels=corpus))
+for(m in 1:M){
+cluster_log_probs[i,m]<-sum(word_count_i*log(estimated_text_probs[,m]))+dnorm(simmed_data2$forecast[i],estimated_forecast_means[m],log=T)
+}}
+
+cluster_log_probs<-t(apply(cluster_log_probs,1,function(x){x-max(x)}))
+cluster_probs<-t(apply(cluster_log_probs,1,function(x){exp(x)/sum(exp(x))}))
+
+for(i in 1:N){
+ simmed_data2$cluster[i]<-sample.int(M,1,prob=cluster_probs[i,])
+}
+head(cluster_probs)
+```
+Now we return to step in which we estimate the word distributions and forecast distribution conditional on the cluster memberships... and we repeat this many times. This takes about a minute.
+```{r,eval=F}
+N_its<-2000
+pb<-txtProgressBar(min = 0, max = N_its, initial = 0,style=3)
+for(its in 1:N_its){
+setTxtProgressBar(pb,its)
+
+for(m in 1:M){
+ind<-which(simmed_data2$cluster==m) 
+word_counts<-table(factor( strsplit(paste(simmed_data2$comment[ind],collapse=" "),split=" ")[[1]] ,levels=corpus))
+alphamat[,m]<-1+word_counts
+}
+
+for(m in 1:M){
+p<-rgamma(n_corpus,alphamat[,m],1)
+estimated_text_probs[,m]<-p/sum(p)
+}
+
+for(m in 1:M){
+ind<-which(simmed_data$cluster==m)
+estimated_forecast_means[m]<-rnorm( 1,mean=mean(simmed_data2$forecast[ind]),sd=1/(1+length(ind)) )
+}
+
+for(i in 1:N){
+word_count_i<-table(factor( strsplit(simmed_data2$comment[i],split=" ")[[1]] ,levels=corpus))
+for(m in 1:M){
+cluster_log_probs[i,m]<-sum(word_count_i*log(estimated_text_probs[,m]))+dnorm(simmed_data2$forecast[i],estimated_forecast_means[m],log=T)
+}}
+
+cluster_log_probs<-t(apply(cluster_log_probs,1,function(x){x-max(x)}))
+cluster_probs<-t(apply(cluster_log_probs,1,function(x){exp(x)/sum(exp(x))}))
+
+for(i in 1:N){
+ simmed_data2$cluster[i]<-sample.int(M,1,prob=cluster_probs[i,])
+}
+}
+save(simmed_data2,file="simmed_data2.RData")
+```
+Now we can compare a simulated set of cluster memberships (simulated from our posterior distribution using the Gibbs sampler) and the true cluster memberships (which we know because we simulated them).
+```{r}
+load(file="simmed_data2.RData")
+simmed_data2$cluster
+simmed_data$cluster
+```
+We should see that the simulated clustering tends to put users in the same cluster if they really were from the same cluster. Obviously the label for the cluster might be different though.
